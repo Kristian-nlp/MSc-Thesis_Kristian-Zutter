@@ -1,0 +1,81 @@
+# =============================================================================
+# crontab.txt
+#
+# Master's thesis: Learning the Levers — Which Creator-Controllable
+# Features Predict Post Visibility on TikTok, Instagram, and LinkedIn
+# from a Swiss German-Language Perspective
+# Kristian Zutter | HSLU MSc Applied Information and Data Science | 2026
+#
+# Purpose:
+#   Cron schedule for the hourly scrapers, engagement-velocity revisits,
+#   batch feature engineering, daily database backup, and log rotation.
+#
+# Install:  crontab 02_scraper/crontab.txt
+# Verify:   crontab -l
+# Remove:   crontab -r   (removes ALL cron jobs for this user)
+# Debug:    grep CRON /var/log/syslog
+#
+# All times are in UTC (VM default). Switzerland is UTC+1 (CET) / UTC+2 (CEST).
+# flock -n   non-blocking lock; if previous run is still going, skip this one.
+# >> file    append stdout and stderr to the log file.
+# =============================================================================
+
+# Environment
+# Adjust REPO if the repository is checked out at a different location.
+# HOME is set by cron automatically to the invoking user's home directory.
+SHELL=/bin/bash
+PATH=/usr/local/bin:/usr/bin:/bin:/$HOME/.local/bin
+REPO=$HOME/learning-the-levers
+PYTHON=$REPO/.venv/bin/python
+
+# =============================================================================
+# 1. HOURLY SCRAPES
+#    Runs at minute 0 of every hour.
+#    Account alternation (fresh/seeded) handled inside run_hourly.py.
+#    flock prevents overlapping runs if a scrape overruns into the next hour.
+# =============================================================================
+# TikTok removed 2026-03-22: sufficient data collected (~16 days). Proxy budget
+# reserved for LinkedIn + Instagram for remaining collection period.
+# Kill any Chrome/ChromeDriver processes older than 10 min (leaked from prior runs)
+0 * * * *   pkill -9 -f 'chrom' --older-than 10m 2>/dev/null; flock -n /tmp/hourly_scrape.lock $PYTHON $REPO/02_scraper/run_hourly.py --platforms instagram linkedin >> /data/logs/hourly.log 2>&1
+
+# =============================================================================
+# 2. ENGAGEMENT VELOCITY REVISITS
+#    T24 revisits at minute 15, T72 revisits at minute 30.
+#    Both run every hour because posts become eligible throughout the day
+#    (the +/-2h tolerance window in revisit_db.py handles timing).
+#    Separate lock files so T24 and T72 can run concurrently if needed.
+# =============================================================================
+15 * * * *  flock -n /tmp/revisit_t24.lock $PYTHON $REPO/02_scraper/run_revisits.py --revisit-type t24 >> /data/logs/revisit_t24.log 2>&1
+30 * * * *  flock -n /tmp/revisit_t72.lock $PYTHON $REPO/02_scraper/run_revisits.py --revisit-type t72 >> /data/logs/revisit_t72.log 2>&1
+
+# =============================================================================
+# 3. BATCH FEATURE ENGINEERING
+#    Twice daily at 02:45 and 14:45 UTC, offset from :00 to avoid
+#    overlap with hourly scrapes and from :30 to avoid collision with
+#    T72 revisits. nice -n 10 lowers CPU priority so Selenium gets
+#    precedence if a scrape happens to overlap.
+# =============================================================================
+45 2,14 * * *  nice -n 10 $PYTHON $REPO/03_features/run_features_batch.py >> /data/logs/features_batch.log 2>&1
+
+# =============================================================================
+# 4. DAILY BACKUP
+#    SQLite .backup at 03:00 UTC. Safe with WAL mode.
+#    Keeps last 7 days of local backups, rotates older ones.
+# =============================================================================
+0 3 * * *  /bin/bash $REPO/04_database/backup_db.sh >> /data/logs/backup.log 2>&1
+
+# =============================================================================
+# 5. LOG ROTATION CLEANUP
+#    Remove cron log files older than 30 days to prevent disk fill.
+#    Aligned with Python logging_config.py backupCount=30.
+#    Runs daily at 04:00 UTC.
+# =============================================================================
+0 4 * * *  find /data/logs -name "*.log" -type f -mtime +30 -delete 2>/dev/null
+
+# =============================================================================
+# 6. FALLBACK FILE CLEANUP
+#    Remove ingested (.done) fallback files older than 7 days.
+#    Runs daily at 04:05 UTC.
+# =============================================================================
+5 4 * * *  find /data/fallback -name "*.json.done" -type f -mtime +7 -delete 2>/dev/null
